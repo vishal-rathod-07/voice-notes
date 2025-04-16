@@ -1,15 +1,14 @@
 "use client"
 
-import { useState, useEffect } from "react"
-import { getSettings, saveSettings } from "@/lib/db"
+import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Label } from "@/components/ui/label"
-import { Switch } from "@/components/ui/switch"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { Button } from "@/components/ui/button"
+import { Switch } from "@/components/ui/switch"
+import { getDB, getSettings, saveSettings } from "@/lib/db"
+import { Loader2Icon } from "lucide-react"
 import { useTheme } from "next-themes"
-import { Loader2Icon, AlertCircleIcon } from "lucide-react"
-import { getDB } from "@/lib/db"
+import { useEffect, useState } from "react"
 
 export function Settings() {
   const [settings, setSettings] = useState<any>(null)
@@ -64,8 +63,7 @@ export function Settings() {
   const handleSettingChange = async (key: string, value: any) => {
     if (!settings) return
 
-    // Don't allow changing transcriptionMode
-    if (key === "transcriptionMode") return
+  
 
     const updatedSettings = {
       ...settings,
@@ -204,11 +202,15 @@ export function Settings() {
             <div className="flex items-center justify-between">
               <div className="space-y-0.5">
                 <div className="text-sm">Whisper AI Transcription</div>
-                <p className="text-xs text-muted-foreground">Currently unavailable in this environment</p>
+                <p className="text-sm text-muted-foreground">
+                  Additional accuracy and speed with a large language model
+                </p>
               </div>
               <div className="flex items-center space-x-2">
-                <AlertCircleIcon className="w-4 h-4 text-amber-500" />
-                <Switch id="transcription-mode" checked={false} disabled={true} />
+                <Switch id="transcription-mode"
+                  checked={settings?.transcriptionMode === "transformers"}
+                  onCheckedChange={(checked) => handleSettingChange("transcriptionMode", checked ? "transformers" : "web-speech")}
+                />
               </div>
             </div>
           </div>
