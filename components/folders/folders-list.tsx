@@ -98,7 +98,7 @@ export function FoldersList() {
       {folders.length === 0 ? (
         <EmptyState title="No folders yet" description="Create folders to organize your notes." icon="folder" />
       ) : (
-        <div className="space-y-6 pb-24">
+        <div className="space-y-6 pb-24 flex flex-col">
           {folders.map((folder) => (
             <FolderCard key={folder.id} folder={folder} onDelete={handleDeleteFolder} />
           ))}

@@ -57,7 +57,7 @@ export function NotesList({ folderId }: { folderId?: string }) {
   }
 
   return (
-    <div className="space-y-6 mt-4 pb-24 overflow-y-auto max-h-[calc(100vh-13rem)]">
+    <div className="space-y-6 mt-4 pb-24 overflow-y-auto max-h-[calc(100vh-13rem)] flex flex-col">
       {notes.map((note) => (
         <NoteCard key={note.id} note={note} />
       ))}
