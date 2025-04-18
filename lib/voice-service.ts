@@ -15,6 +15,7 @@ interface VoiceServiceOptions {
   onModelLoading?: (isLoading: boolean) => void
   language?: string
   transcriptionMode?: TranscriptionMode
+  preferredMicrophone?: string
 }
 
 // Declare SpeechRecognition types
@@ -44,6 +45,13 @@ export class VoiceService {
   private lastProcessedLength = 0
   private pendingPunctuation = false
   private grammarCorrectionEnabled = false
+  private recognitionRetryCount = 0
+  private maxRecognitionRetries = 3
+  private recognitionRetryDelay = 1500 // 1.5 seconds delay between retries
+  private isRecognitionRestarting = false
+  private noSpeechTimeout: number | null = null;
+  private audioContext: AudioContext | null = null;
+
 
   constructor(options: VoiceServiceOptions = {}) {
     this.options = {
@@ -74,8 +82,89 @@ export class VoiceService {
 
   private handleError(error: Error) {
     console.error("VoiceService error:", error)
+
+     // Specific handling for no-speech errors
+  if (error.message.includes("no-speech")) {
+    if (this.options.onError) {
+      this.options.onError(new Error(
+        "No speech detected. Please:\n" +
+        "• Speak louder and clearer\n" +
+        "• Check microphone connection\n" +
+        "• Reduce background noise"
+      ));
+    }
+    
+    // Only auto-retry if we're actively recording
+    if (this.recordingState === "recording" && 
+        this.recognitionRetryCount < this.maxRecognitionRetries) {
+      this.recognitionRetryCount++;
+      setTimeout(() => {
+        try {
+          this.recognition?.start();
+        } catch (retryError) {
+          console.error("Retry failed:", retryError);
+        }
+      }, 1000);
+    }
+    return;
+  }
+
+    // Check if it's a network error from speech recognition
+    if (error.message === "network" && this.recordingState === "recording") {
+      this.handleNetworkError()
+      return
+    }
+
     if (this.options.onError) {
       this.options.onError(error)
+    }
+  }
+
+  private handleNetworkError() {
+    // Only attempt to restart if we're still recording and haven't exceeded retry limit
+    if (this.recordingState === "recording" && this.recognitionRetryCount < this.maxRecognitionRetries) {
+      console.log(
+        `Network error in speech recognition. Retrying (${this.recognitionRetryCount + 1}/${this.maxRecognitionRetries})...`,
+      )
+
+      this.recognitionRetryCount++
+      this.isRecognitionRestarting = true
+
+      // Notify the user about the retry
+      if (this.options.onError) {
+        this.options.onError(
+          new Error(
+            `Network error. Retrying speech recognition (${this.recognitionRetryCount}/${this.maxRecognitionRetries})...`,
+          ),
+        )
+      }
+
+      // Wait a bit before retrying
+      setTimeout(() => {
+        if (this.recordingState === "recording") {
+          try {
+            // Restart speech recognition
+            const recognition = this.initializeSpeechRecognition()
+            if (recognition) recognition.start()
+            this.isRecognitionRestarting = false
+          } catch (error) {
+            console.error("Error restarting speech recognition:", error)
+            this.isRecognitionRestarting = false
+
+            // If we've exhausted retries, notify the user
+            if (this.recognitionRetryCount >= this.maxRecognitionRetries) {
+              if (this.options.onError) {
+                this.options.onError(new Error("Speech recognition unavailable. Please check your network connection."))
+              }
+            }
+          }
+        }
+      }, this.recognitionRetryDelay)
+    } else if (this.recognitionRetryCount >= this.maxRecognitionRetries) {
+      // We've exhausted our retries
+      if (this.options.onError) {
+        this.options.onError(new Error("Speech recognition unavailable. Please check your network connection."))
+      }
     }
   }
 
@@ -86,7 +175,11 @@ export class VoiceService {
     }
   }
 
-  private updateTranscript(final: string, interim: string) {
+  public updateTranscript(final: string, interim: string) {
+    console.log("Updating transcript:", { final, interim });
+    // Reset retry count on successful transcript update
+    this.recognitionRetryCount = 0
+
     this.finalTranscript = final
     this.interimTranscript = interim
 
@@ -227,8 +320,10 @@ export class VoiceService {
     this.recognition.continuous = true
     this.recognition.interimResults = true
     this.recognition.lang = this.options.language || "en-US"
+    this.recognition.maxAlternatives = 1
 
     this.recognition.onresult = (event: any) => {
+      console.log("SpeechRecognition result event:", event);
       let newInterimTranscript = ""
       let newFinalTranscript = this.finalTranscript
 
@@ -249,12 +344,24 @@ export class VoiceService {
     }
 
     this.recognition.onerror = (event: any) => {
-      this.handleError(new Error(`Speech recognition error: ${event.error}`))
+      console.error("SpeechRecognition error event:", event)
+
+       // Map error codes to friendly messages
+    const errorMessages: Record<string, string> = {
+      "no-speech": "No speech detected",
+      "audio-capture": "Microphone problem",
+      "network": "Network error",
+      "not-allowed": "Permission denied"
+    };
+
+      this.handleError(new Error(errorMessages[event.error] || event.error));
+
     }
 
     this.recognition.onend = () => {
       // Only restart if we're still in recording state and not paused
-      if (this.recordingState === "recording") {
+      // and not already in the process of restarting due to an error
+      if (this.recordingState === "recording" && !this.isRecognitionRestarting) {
         try {
           this.recognition?.start()
         } catch (error) {
@@ -266,10 +373,77 @@ export class VoiceService {
     return this.recognition
   }
 
+  private cleanupResources() {
+    if (this.noSpeechTimeout) {
+      clearTimeout(this.noSpeechTimeout);
+      this.noSpeechTimeout = null;
+    }
+    
+    if (this.audioContext) {
+      this.audioContext.close();
+      this.audioContext = null;
+    }
+  }
+
+  private async setupMicrophoneMonitoring() {
+    try {
+      if (!this.stream) {
+        this.stream = await navigator.mediaDevices.getUserMedia({ 
+          audio: this.options.preferredMicrophone ? 
+            { deviceId: { exact: this.options.preferredMicrophone } } : 
+            true
+        });
+      }
+  
+      this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const analyser = this.audioContext.createAnalyser();
+      const source = this.audioContext.createMediaStreamSource(this.stream);
+      source.connect(analyser);
+  
+      // Check audio levels periodically
+      setInterval(() => {
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+        analyser.getByteTimeDomainData(dataArray);
+        const isReceivingAudio = dataArray.some(level => level > 0);
+        
+        if (!isReceivingAudio && this.recordingState === "recording") {
+          console.warn("Microphone not detecting audio input");
+        }
+      }, 2000);
+    } catch (err) {
+      console.error("Microphone monitoring failed:", err);
+    }
+  }
+
   public async startRecording() {
     if (this.recordingState === "recording") return
 
     try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const audioContext = new AudioContext();
+      const analyser = audioContext.createAnalyser();
+      const microphone = audioContext.createMediaStreamSource(stream);
+      microphone.connect(analyser);
+      
+      // Check for audio input
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteTimeDomainData(dataArray);
+      const isReceivingAudio = dataArray.some(level => level > 0);
+      
+      if (!isReceivingAudio) {
+        this.handleError(new Error("microphone-not-detecting-audio"));
+      }
+    } catch (error) {
+      this.handleError(new Error("Could not access microphone"));
+      return;
+    }
+
+    try {
+
+      if (this.noSpeechTimeout) {
+        clearTimeout(this.noSpeechTimeout);
+        this.noSpeechTimeout = null;
+      }
       // Reset transcript state when starting a new recording
       if (this.recordingState === "inactive") {
         this.finalTranscript = ""
@@ -279,15 +453,36 @@ export class VoiceService {
         this.lastProcessedLength = 0
         this.lastSpeechTimestamp = Date.now()
         this.pendingPunctuation = false
+        this.recognitionRetryCount = 0
+        this.isRecognitionRestarting = false
       }
 
       // Initialize speech recognition
       const recognition = this.initializeSpeechRecognition()
-      if (recognition) recognition.start()
+      if (recognition) {
+        try {
+          recognition.start()
+          console.log("Speech recognition started successfully")
+        } catch (e) {
+          console.error("Error starting speech recognition:", e)
+          this.handleError(e as Error)
+        }
+      }
 
-      // Initialize audio recording
+      // Initialize audio recording with the preferred microphone if specified
       if (!this.stream) {
-        this.stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+        const constraints: MediaStreamConstraints = {
+          audio: this.options.preferredMicrophone ? { deviceId: { exact: this.options.preferredMicrophone } } : true,
+        }
+
+        try {
+          this.stream = await navigator.mediaDevices.getUserMedia(constraints)
+          console.log("Using microphone:", this.options.preferredMicrophone || "default")
+        } catch (err) {
+          console.error("Error accessing preferred microphone, falling back to default:", err)
+          // Fall back to default microphone
+          this.stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+        }
       }
 
       this.mediaRecorder = new MediaRecorder(this.stream)
@@ -302,6 +497,20 @@ export class VoiceService {
         }
       }
 
+      if (this.options.onTranscriptUpdate) {
+        this.options.onTranscriptUpdate("Listening... Please speak now");
+      }
+
+      this.noSpeechTimeout = window.setTimeout(() => {
+        if (this.finalTranscript === "" && this.interimTranscript === "") {
+          this.handleError(new Error("no-speech"));
+        }
+      }, 5000);
+
+      // Initialize microphone monitoring
+      await this.setupMicrophoneMonitoring();
+    
+
       // Start recording
       this.mediaRecorder.start(1000)
       this.updateState("recording")
@@ -309,6 +518,8 @@ export class VoiceService {
     } catch (error) {
       this.handleError(error as Error)
     }
+
+
   }
 
   public pauseRecording() {
@@ -356,10 +567,22 @@ export class VoiceService {
     if (this.recordingState !== "paused") return
 
     try {
+      // Reset retry count when resuming
+      this.recognitionRetryCount = 0
+      this.isRecognitionRestarting = false
+
       // When resuming, we need to reinitialize the recognition
       // to avoid duplication issues
       const recognition = this.initializeSpeechRecognition()
-      if (recognition) recognition.start()
+      if (recognition) {
+        try {
+          recognition.start()
+          console.log("Speech recognition resumed successfully")
+        } catch (e) {
+          console.error("Error resuming speech recognition:", e)
+          this.handleError(e as Error)
+        }
+      }
 
       if (this.mediaRecorder && this.mediaRecorder.state === "paused") {
         this.mediaRecorder.resume()
@@ -374,6 +597,9 @@ export class VoiceService {
   }
 
   public async stopRecording(): Promise<{ id: string; audioUrl?: string }> {
+
+    this.cleanupResources();
+
     if (this.recordingState === "inactive") return { id: "" }
 
     return new Promise((resolve) => {
@@ -443,6 +669,8 @@ export class VoiceService {
             this.resultIndex = 0
             this.lastProcessedLength = 0
             this.audioChunks = []
+            this.recognitionRetryCount = 0
+            this.isRecognitionRestarting = false
             this.updateState("inactive")
             this.releaseWakeLock()
 
@@ -471,6 +699,8 @@ export class VoiceService {
   }
 
   public cancelRecording() {
+    this.cleanupResources();
+
     try {
       if (this.recognition) {
         try {
@@ -493,6 +723,8 @@ export class VoiceService {
       this.resultIndex = 0
       this.lastProcessedLength = 0
       this.audioChunks = []
+      this.recognitionRetryCount = 0
+      this.isRecognitionRestarting = false
       this.updateState("inactive")
       this.releaseWakeLock()
 
@@ -515,17 +747,12 @@ export class VoiceService {
   }
 
   public async switchTranscriptionMode(mode: TranscriptionMode): Promise<void> {
-    // Always throw an error if trying to switch to transformers mode
-    if (mode === "transformers") {
-      throw new Error("Whisper AI transcription is currently unavailable in this environment")
-    }
-
-    // Only web-speech mode is supported
-    this.transcriptionMode = "web-speech"
+    // Allow switching to transformers mode now
+    this.transcriptionMode = mode
   }
 
   public getTranscriptionMode(): TranscriptionMode {
-    return "web-speech" // Always return web-speech
+    return this.transcriptionMode
   }
 
   public toggleSentenceDetection(enabled: boolean): void {
