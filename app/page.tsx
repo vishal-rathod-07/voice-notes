@@ -1,9 +1,14 @@
 import { Suspense } from "react"
+import dynamic from "next/dynamic"
 import { PageLayout } from "@/components/layouts/page-layout"
 import { NotesList } from "@/components/notes/notes-list"
-import { RecordButton } from "@/components/recording/record-button"
 import { SearchBar } from "@/components/search/search-bar"
 import { LoadingNotes } from "@/components/ui/loading-notes"
+
+const RecordButton = dynamic(
+  () => import("@/components/recording/record-button").then(mod => ({ default: mod.RecordButton })),
+  { ssr: false }
+)
 
 export default function Home() {
   return (
